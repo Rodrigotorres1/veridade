@@ -9,6 +9,8 @@ mlruns/*
 !mlruns/.gitkeep
 *.pt
 *.pth
+# exceção: o modelo final é pequeno e a API precisa dele
+!models/multiage/modelo.pt
 
 # Python
 __pycache__/
