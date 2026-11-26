@@ -1,0 +1,135 @@
+# VerIdade · solução completa
+# Sobe tudo com:  docker compose up --build
+#
+# Fluxo:  totem (embarcado simulado) --MQTT--> mosquitto --> ingestor --> postgres
+#         airflow (DAG a cada 1 min): pendentes -> validação -> API (MultiAge) -> predições -> monitoramento -> MLflow
+#         dashboard (Streamlit) <-- API
+
+x-env-comum: &env-comum
+  VERIDADE_DB_URL: postgresql://veridade:veridade@postgres:5432/veridade
+  MQTT_HOST: mosquitto
+  MQTT_PORT: "1883"
+  API_URL: http://api:8000
+  MLFLOW_URL: http://mlflow:5000
+  TZ: America/Sao_Paulo
+
+services:
+  # ------------------------------------------------------------ infraestrutura
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: veridade-mosquitto
+    ports: ["1883:1883"]
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
+      interval: 10s
+      retries: 10
+
+  postgres:
+    image: postgres:16
+    container_name: veridade-postgres
+    environment:
+      POSTGRES_USER: veridade
+      POSTGRES_PASSWORD: veridade
+      POSTGRES_DB: veridade
+      TZ: America/Sao_Paulo
+    ports: ["5433:5432"]          # 5433 no seu PC para não conflitar com um Postgres local
+    volumes:
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - pg_dados:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veridade -d veridade"]
+      interval: 5s
+      retries: 20
+
+  mlflow:
+    build: {context: ., dockerfile: docker/mlflow/Dockerfile}
+    container_name: veridade-mlflow
+    ports: ["5000:5000"]
+    volumes:
+      - ./mlruns:/mlflow
+      - ./mlruns:/content/repo/mlruns   # faz os artefatos registrados no Colab abrirem aqui também
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      retries: 30
+
+  # ------------------------------------------------------------ embarcado e ingestão
+  totem:
+    build: {context: ., dockerfile: embedded/Dockerfile}
+    container_name: veridade-totem
+    command: python embedded/totem.py
+    environment:
+      <<: *env-comum
+      TOTENS: "totem-recife-01,totem-recife-02,totem-olinda-01"
+      INTERVALO_S: "1.0"           # uma captura por segundo (somando todos os totens)
+    volumes:
+      - ./data/processed:/app/data/processed:ro
+    depends_on:
+      mosquitto: {condition: service_healthy}
+      ingestor: {condition: service_started}
+
+  ingestor:
+    build: {context: ., dockerfile: embedded/Dockerfile}
+    container_name: veridade-ingestor
+    command: python embedded/ingestor.py
+    environment: *env-comum
+    depends_on:
+      mosquitto: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+
+  # ------------------------------------------------------------ modelo e visualização
+  api:
+    build: {context: ., dockerfile: api/Dockerfile}
+    container_name: veridade-api
+    ports: ["8000:8000"]
+    environment: *env-comum
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      retries: 30
+
+  dashboard:
+    build: {context: ., dockerfile: app/Dockerfile}
+    container_name: veridade-dashboard
+    ports: ["8501:8501"]
+    environment:
+      <<: *env-comum
+      AIRFLOW_URL: http://airflow:8080
+    depends_on:
+      api: {condition: service_healthy}
+
+  # ------------------------------------------------------------ orquestração
+  airflow:
+    image: apache/airflow:2.10.5-python3.11
+    container_name: veridade-airflow
+    ports: ["8080:8080"]
+    environment:
+      <<: *env-comum
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://veridade:veridade@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+      AIRFLOW__WEBSERVER__SECRET_KEY: veridade-dev
+      PYTHONPATH: /opt/airflow/dags
+    volumes:
+      - ./dags:/opt/airflow/dags
+    command: >
+      bash -c "airflow db migrate &&
+               (airflow users create --username admin --password admin --firstname Admin --lastname VerIdade
+                  --role Admin --email admin@veridade.local || true) &&
+               (airflow scheduler &) &&
+               exec airflow webserver"
+    depends_on:
+      postgres: {condition: service_healthy}
+      api: {condition: service_healthy}
+      mlflow: {condition: service_healthy}
+
+volumes:
+  pg_dados:
